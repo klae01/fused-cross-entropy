@@ -16,63 +16,84 @@ def _fused_nll_fwd_kernel(
     stride_w_n3,
     stride_w_n2,
     stride_b_n3,
-    N1: tl.constexpr,
+    N1,
     N2: tl.constexpr,
-    N3: tl.constexpr,
+    N3,
     HAS_BIAS: tl.constexpr,
     BLOCK_N1: tl.constexpr,
     BLOCK_N2: tl.constexpr,
     BLOCK_N3: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr = "tf32",
 ):
     pid = tl.program_id(0)
     offs_n1 = pid * BLOCK_N1 + tl.arange(0, BLOCK_N1)
+    offs_n3 = tl.arange(0, BLOCK_N3)
     mask_n1 = offs_n1 < N1
-    target = tl.load(Y + offs_n1, mask=mask_n1, other=0)
+    target_y = tl.load(
+        Y + offs_n1,
+        mask=mask_n1,
+        other=0,
+        eviction_policy="evict_first",
+    )
     m_i = tl.zeros([BLOCK_N1], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_N1], dtype=tl.float32)
     target_logit = tl.zeros([BLOCK_N1], dtype=tl.float32)
-    offs_n2, offs_n3 = tl.arange(0, BLOCK_N2), tl.arange(0, BLOCK_N3)
-    for off_n3_start in range(0, N3, BLOCK_N3):
+    off_n3_start = 0
+    while off_n3_start < N3:
         offs_n3_curr = off_n3_start + offs_n3
         mask_n3 = offs_n3_curr < N3
         acc = tl.zeros([BLOCK_N1, BLOCK_N3], dtype=tl.float32)
         if HAS_BIAS:
-            acc += tl.load(B + offs_n3_curr * stride_b_n3, mask=mask_n3, other=0.0).to(
-                tl.float32
-            )[None, :]
-        for off_n2_start in range(0, N2, BLOCK_N2):
-            offs_n2_curr = off_n2_start + offs_n2
-            mask_n2 = offs_n2_curr < N2
-            x_chunk = tl.load(
-                X
-                + (
-                    offs_n1[:, None] * stride_x_n1 + offs_n2_curr[None, :] * stride_x_n2
-                ),
-                mask=mask_n1[:, None] & mask_n2[None, :],
+            bias_val = tl.load(
+                B + offs_n3_curr * stride_b_n3,
+                mask=mask_n3,
                 other=0.0,
+                eviction_policy="evict_first",
             )
-            w_chunk = tl.load(
-                W
-                + (
-                    offs_n3_curr[None, :] * stride_w_n3
-                    + offs_n2_curr[:, None] * stride_w_n2
-                ),
-                mask=mask_n2[:, None] & mask_n3[None, :],
-                other=0.0,
-            )
-            acc = tl.dot(x_chunk, w_chunk, acc, allow_tf32=True)
-        acc = tl.where(mask_n3[None, :], acc, -float("inf"))
-        m_curr = tl.max(acc, 1)
-        m_new = tl.maximum(m_i, m_curr)
-        l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(acc - m_new[:, None]), 1)
-        m_i = m_new
-        is_target = offs_n3_curr[None, :] == target[:, None]
-        target_logit += tl.sum(
-            tl.where(is_target & mask_n1[:, None] & mask_n3[None, :], acc, 0.0), 1
+            acc += bias_val.to(tl.float32)[None, :]
+        x_block_ptr = tl.make_block_ptr(
+            base=X,
+            shape=(N1, N2),
+            strides=(stride_x_n1, stride_x_n2),
+            offsets=(pid * BLOCK_N1, 0),
+            block_shape=(BLOCK_N1, BLOCK_N2),
+            order=(1, 0),
         )
+        w_block_ptr = tl.make_block_ptr(
+            base=W,
+            shape=(N3, N2),
+            strides=(stride_w_n3, stride_w_n2),
+            offsets=(off_n3_start, 0),
+            block_shape=(BLOCK_N3, BLOCK_N2),
+            order=(1, 0),
+        )
+        for k in range(0, N2, BLOCK_N2):
+            a = tl.load(
+                x_block_ptr,
+                boundary_check=(0, 1),
+                eviction_policy="evict_last",
+            )
+            b = tl.load(
+                w_block_ptr,
+                boundary_check=(0, 1),
+                eviction_policy="evict_first",
+            )
+            acc = tl.dot(a, tl.trans(b), acc, input_precision=INPUT_PRECISION)
+            x_block_ptr = tl.advance(x_block_ptr, (0, BLOCK_N2))
+            w_block_ptr = tl.advance(w_block_ptr, (0, BLOCK_N2))
+        acc = tl.where(mask_n3[None, :], acc, -float("inf"))
+        m_curr = tl.max(acc, axis=1)
+        m_new = tl.maximum(m_i, m_curr)
+        alpha = tl.exp(m_i - m_new)
+        beta = tl.exp(m_curr - m_new)
+        l_curr = tl.sum(tl.exp(acc - m_curr[:, None]), axis=1)
+        l_i = l_i * alpha + l_curr * beta
+        m_i = m_new
+        is_target = offs_n3_curr[None, :] == target_y[:, None]
+        target_logit += tl.sum(tl.where(is_target & mask_n3[None, :], acc, 0.0), axis=1)
+        off_n3_start += BLOCK_N3
     lse = m_i + tl.log(l_i)
     tl.store(LSE + offs_n1, lse, mask=mask_n1)
-
     loss = (lse - target_logit).to(X.dtype.element_ty)
     tl.store(Out + offs_n1, loss, mask=mask_n1)
 
