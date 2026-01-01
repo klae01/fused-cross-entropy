@@ -1,0 +1,31 @@
+# Fused Cross-Entropy in Triton
+
+A Triton implementation of the Fused Cross-Entropy loss function.
+
+## Installation
+
+```bash
+pip install git+https://github.com/your-username/fused-cross-entropy.git
+```
+
+## Development
+
+This project uses `ruff` for linting/formatting and `pytest` for numerical validation, managed via `pre-commit`.
+
+### Setup
+
+1.  Clone the repository.
+2.  Install development dependencies and pre-commit hooks:
+    ```bash
+    pip install -e .[dev]
+    pre-commit install
+    ```
+
+### Running Tests
+
+The test suite validates the numerical accuracy of the Triton kernels against the native PyTorch implementation using Triton's CPU interpreter. The pre-commit hook runs these tests automatically, but you can also run them manually:
+
+```bash
+# This forces the Triton interpreter (CPU backend)
+TRITON_INTERPRET=1 pytest
+```

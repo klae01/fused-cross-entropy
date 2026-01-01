@@ -1,0 +1,36 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.13'
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install dependencies
+        run: uv sync --only-group ci-ruff
+      - name: Run ruff linter
+        run: uv run --only-group ci-ruff ruff check .
+      - name: Run ruff formatter check
+        run: uv run --only-group ci-ruff ruff format --check .
+
+  test-numerical:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install dependencies
+        run: uv sync --group ci-error --no-dev
+      - name: Run numerical tests on Triton CPU backend
+        env:
+          TRITON_INTERPRET: 1
+        run: uv run --group ci-error --no-dev pytest
