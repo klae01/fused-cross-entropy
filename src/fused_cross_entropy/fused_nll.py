@@ -2,6 +2,9 @@ import torch
 import triton
 import triton.language as tl
 
+p_dtype = tl.float32
+TORCH_P_DTYPE = torch.float32
+
 
 @triton.jit
 def _fused_nll_fwd_kernel(
@@ -25,40 +28,31 @@ def _fused_nll_fwd_kernel(
     BLOCK_N3: tl.constexpr,
     INPUT_PRECISION: tl.constexpr = "tf32",
 ):
+    c_dtype = X.dtype.element_ty
     pid = tl.program_id(0)
     offs_n1 = pid * BLOCK_N1 + tl.arange(0, BLOCK_N1)
-    offs_n3 = tl.arange(0, BLOCK_N3)
     mask_n1 = offs_n1 < N1
-    target_y = tl.load(
-        Y + offs_n1,
-        mask=mask_n1,
-        other=0,
-        eviction_policy="evict_first",
+    target_y = tl.load(Y + offs_n1, mask=mask_n1, other=0)
+    m_i = tl.zeros([BLOCK_N1], dtype=p_dtype) - float("inf")
+    l_i = tl.zeros([BLOCK_N1], dtype=p_dtype)
+    target_logit = tl.zeros([BLOCK_N1], dtype=p_dtype)
+    x_block_ptr = tl.make_block_ptr(
+        base=X,
+        shape=(N1, N2),
+        strides=(stride_x_n1, stride_x_n2),
+        offsets=(pid * BLOCK_N1, 0),
+        block_shape=(BLOCK_N1, BLOCK_N2),
+        order=(1, 0),
     )
-    m_i = tl.zeros([BLOCK_N1], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_N1], dtype=tl.float32)
-    target_logit = tl.zeros([BLOCK_N1], dtype=tl.float32)
+    offs_n3 = tl.arange(0, BLOCK_N3)
     off_n3_start = 0
     while off_n3_start < N3:
         offs_n3_curr = off_n3_start + offs_n3
         mask_n3 = offs_n3_curr < N3
-        acc = tl.zeros([BLOCK_N1, BLOCK_N3], dtype=tl.float32)
+        logits = tl.zeros([BLOCK_N1, BLOCK_N3], dtype=p_dtype)
         if HAS_BIAS:
-            bias_val = tl.load(
-                B + offs_n3_curr * stride_b_n3,
-                mask=mask_n3,
-                other=0.0,
-                eviction_policy="evict_first",
-            )
-            acc += bias_val.to(tl.float32)[None, :]
-        x_block_ptr = tl.make_block_ptr(
-            base=X,
-            shape=(N1, N2),
-            strides=(stride_x_n1, stride_x_n2),
-            offsets=(pid * BLOCK_N1, 0),
-            block_shape=(BLOCK_N1, BLOCK_N2),
-            order=(1, 0),
-        )
+            bias_val = tl.load(B + offs_n3_curr * stride_b_n3, mask=mask_n3, other=0.0)
+            logits += bias_val.to(p_dtype)[None, :]
         w_block_ptr = tl.make_block_ptr(
             base=W,
             shape=(N3, N2),
@@ -67,34 +61,36 @@ def _fused_nll_fwd_kernel(
             block_shape=(BLOCK_N3, BLOCK_N2),
             order=(1, 0),
         )
+        x_ptr = x_block_ptr
+        w_ptr = w_block_ptr
         for k in range(0, N2, BLOCK_N2):
-            a = tl.load(
-                x_block_ptr,
-                boundary_check=(0, 1),
-                eviction_policy="evict_last",
+            x_chunk = tl.load(x_ptr, boundary_check=(0, 1))
+            w_chunk = tl.load(w_ptr, boundary_check=(0, 1))
+            logits = tl.dot(
+                x_chunk,
+                tl.trans(w_chunk),
+                logits,
+                input_precision=INPUT_PRECISION,
+                out_dtype=p_dtype,
             )
-            b = tl.load(
-                w_block_ptr,
-                boundary_check=(0, 1),
-                eviction_policy="evict_first",
-            )
-            acc = tl.dot(a, tl.trans(b), acc, input_precision=INPUT_PRECISION)
-            x_block_ptr = tl.advance(x_block_ptr, (0, BLOCK_N2))
-            w_block_ptr = tl.advance(w_block_ptr, (0, BLOCK_N2))
-        acc = tl.where(mask_n3[None, :], acc, -float("inf"))
-        m_curr = tl.max(acc, axis=1)
+            x_ptr = tl.advance(x_ptr, (0, BLOCK_N2))
+            w_ptr = tl.advance(w_ptr, (0, BLOCK_N2))
+        logits = tl.where(mask_n3[None, :], logits, -float("inf"))
+        m_curr = tl.max(logits, axis=1)
         m_new = tl.maximum(m_i, m_curr)
         alpha = tl.exp(m_i - m_new)
         beta = tl.exp(m_curr - m_new)
-        l_curr = tl.sum(tl.exp(acc - m_curr[:, None]), axis=1)
+        l_curr = tl.sum(tl.exp(logits - m_curr[:, None]), axis=1)
         l_i = l_i * alpha + l_curr * beta
         m_i = m_new
         is_target = offs_n3_curr[None, :] == target_y[:, None]
-        target_logit += tl.sum(tl.where(is_target & mask_n3[None, :], acc, 0.0), axis=1)
+        target_logit += tl.sum(
+            tl.where(is_target & mask_n3[None, :], logits, 0.0), axis=1
+        )
         off_n3_start += BLOCK_N3
     lse = m_i + tl.log(l_i)
     tl.store(LSE + offs_n1, lse, mask=mask_n1)
-    loss = (lse - target_logit).to(X.dtype.element_ty)
+    loss = (lse - target_logit).to(c_dtype)
     tl.store(Out + offs_n1, loss, mask=mask_n1)
 
 
@@ -112,87 +108,91 @@ def _fused_nll_bwd_dx_kernel(
     stride_w_n3,
     stride_w_n2,
     stride_b_n3,
-    N1: tl.constexpr,
+    N1,
     N2: tl.constexpr,
-    N3: tl.constexpr,
+    N3,
     HAS_BIAS: tl.constexpr,
     BLOCK_N1: tl.constexpr,
     BLOCK_N2: tl.constexpr,
     BLOCK_N3: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr = "tf32",
 ):
+    c_dtype = X.dtype.element_ty
     pid_n1 = tl.program_id(0)
     offs_n1 = pid_n1 * BLOCK_N1 + tl.arange(0, BLOCK_N1)
     mask_n1 = offs_n1 < N1
     lse = tl.load(LSE + offs_n1, mask=mask_n1, other=0.0)
-    target = tl.load(Y + offs_n1, mask=mask_n1, other=0)
-    grad_out = tl.load(GradOut + offs_n1, mask=mask_n1, other=0.0).to(tl.float32)
-
-    offs_n2, offs_n3 = tl.arange(0, BLOCK_N2), tl.arange(0, BLOCK_N3)
-
-    for off_n3_start in range(0, N3, BLOCK_N3):
+    target_y = tl.load(Y + offs_n1, mask=mask_n1, other=0)
+    grad_out = tl.load(GradOut + offs_n1, mask=mask_n1, other=0.0).to(p_dtype)
+    x_block_ptr = tl.make_block_ptr(
+        base=X,
+        shape=(N1, N2),
+        strides=(stride_x_n1, stride_x_n2),
+        offsets=(pid_n1 * BLOCK_N1, 0),
+        block_shape=(BLOCK_N1, BLOCK_N2),
+        order=(1, 0),
+    )
+    grad_x_block_ptr = tl.make_block_ptr(
+        base=GradX,
+        shape=(N1, N2),
+        strides=(stride_x_n1, stride_x_n2),
+        offsets=(pid_n1 * BLOCK_N1, 0),
+        block_shape=(BLOCK_N1, BLOCK_N2),
+        order=(1, 0),
+    )
+    offs_n3 = tl.arange(0, BLOCK_N3)
+    off_n3_start = 0
+    while off_n3_start < N3:
         offs_n3_curr = off_n3_start + offs_n3
         mask_n3 = offs_n3_curr < N3
-        # Recompute logits
-        logits = tl.zeros([BLOCK_N1, BLOCK_N3], dtype=tl.float32)
+        logits = tl.zeros([BLOCK_N1, BLOCK_N3], dtype=p_dtype)
         if HAS_BIAS:
-            logits += tl.load(
-                B + offs_n3_curr * stride_b_n3, mask=mask_n3, other=0.0
-            ).to(tl.float32)[None, :]
-        for off_n2_start in range(0, N2, BLOCK_N2):
-            offs_n2_curr = off_n2_start + offs_n2
-            mask_n2 = offs_n2_curr < N2
-            x_chunk = tl.load(
-                X
-                + (
-                    offs_n1[:, None] * stride_x_n1 + offs_n2_curr[None, :] * stride_x_n2
-                ),
-                mask=mask_n1[:, None] & mask_n2[None, :],
-                other=0.0,
+            bias_val = tl.load(B + offs_n3_curr * stride_b_n3, mask=mask_n3, other=0.0)
+            logits += bias_val.to(p_dtype)[None, :]
+        w_block_ptr = tl.make_block_ptr(
+            base=W,
+            shape=(N3, N2),
+            strides=(stride_w_n3, stride_w_n2),
+            offsets=(off_n3_start, 0),
+            block_shape=(BLOCK_N3, BLOCK_N2),
+            order=(1, 0),
+        )
+        x_ptr = x_block_ptr
+        w_ptr = w_block_ptr
+        for k in range(0, N2, BLOCK_N2):
+            x_chunk = tl.load(x_ptr, boundary_check=(0, 1))
+            w_chunk = tl.load(w_ptr, boundary_check=(0, 1))
+            logits = tl.dot(
+                x_chunk,
+                tl.trans(w_chunk),
+                logits,
+                input_precision=INPUT_PRECISION,
+                out_dtype=p_dtype,
             )
-            w_chunk = tl.load(
-                W
-                + (
-                    offs_n3_curr[None, :] * stride_w_n3
-                    + offs_n2_curr[:, None] * stride_w_n2
-                ),
-                mask=mask_n2[:, None] & mask_n3[None, :],
-                other=0.0,
-            )
-            logits = tl.dot(x_chunk, w_chunk, logits, allow_tf32=True)
-
-        logits = tl.where(mask_n1[:, None] & mask_n3[None, :], logits, -float("inf"))
+            x_ptr = tl.advance(x_ptr, (0, BLOCK_N2))
+            w_ptr = tl.advance(w_ptr, (0, BLOCK_N2))
+        logits = tl.where(mask_n3[None, :], logits, -float("inf"))
         probs = tl.exp(logits - lse[:, None])
-        probs = tl.where(mask_n1[:, None] & mask_n3[None, :], probs, 0.0)
-        is_target = offs_n3_curr[None, :] == target[:, None]
-        probs = tl.where(is_target & mask_n1[:, None], probs - 1.0, probs)
-        grad_logits = (probs * grad_out[:, None]).to(X.dtype.element_ty)
-
-        for off_n2_start in range(0, N2, BLOCK_N2):
-            offs_n2_curr = off_n2_start + offs_n2
-            mask_n2 = offs_n2_curr < N2
-            w_chunk_t = tl.load(
-                W
-                + (
-                    offs_n3_curr[:, None] * stride_w_n3
-                    + offs_n2_curr[None, :] * stride_w_n2
-                ),
-                mask=mask_n3[:, None] & mask_n2[None, :],
-                other=0.0,
+        probs = tl.where(mask_n3[None, :], probs, 0.0)
+        is_target = offs_n3_curr[None, :] == target_y[:, None]
+        probs = tl.where(is_target, probs - 1.0, probs)
+        grad_logits = (probs * grad_out[:, None]).to(c_dtype)
+        g_ptr = grad_x_block_ptr
+        w_ptr = w_block_ptr
+        for k in range(0, N2, BLOCK_N2):
+            w_chunk = tl.load(w_ptr, boundary_check=(0, 1))
+            dx_part = tl.load(g_ptr, boundary_check=(0, 1))
+            dx_part = tl.dot(
+                grad_logits,
+                w_chunk,
+                dx_part,
+                input_precision=INPUT_PRECISION,
+                out_dtype=c_dtype,
             )
-            dx_part = tl.dot(grad_logits, w_chunk_t, allow_tf32=True)
-
-            # Use add store
-            grad_x_ptr = GradX + (
-                offs_n1[:, None] * stride_x_n1 + offs_n2_curr[None, :] * stride_x_n2
-            )
-            current_grad_x = tl.load(
-                grad_x_ptr, mask=mask_n1[:, None] & mask_n2[None, :], other=0.0
-            )
-            tl.store(
-                grad_x_ptr,
-                current_grad_x + dx_part.to(X.dtype.element_ty),
-                mask=mask_n1[:, None] & mask_n2[None, :],
-            )
+            tl.store(g_ptr, dx_part, boundary_check=(0, 1))
+            w_ptr = tl.advance(w_ptr, (0, BLOCK_N2))
+            g_ptr = tl.advance(g_ptr, (0, BLOCK_N2))
+        off_n3_start += BLOCK_N3
 
 
 @triton.jit
@@ -209,91 +209,91 @@ def _fused_nll_bwd_dw_kernel(
     stride_w_n3,
     stride_w_n2,
     stride_b_n3,
-    N1: tl.constexpr,
+    N1,
     N2: tl.constexpr,
-    N3: tl.constexpr,
+    N3,
     HAS_BIAS: tl.constexpr,
     BLOCK_N1: tl.constexpr,
     BLOCK_N2: tl.constexpr,
     BLOCK_N3: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr = "tf32",
 ):
+    c_dtype = X.dtype.element_ty
     pid_n3 = tl.program_id(0)
     offs_n3 = pid_n3 * BLOCK_N3 + tl.arange(0, BLOCK_N3)
     mask_n3 = offs_n3 < N3
-
-    offs_n2, offs_n1 = tl.arange(0, BLOCK_N2), tl.arange(0, BLOCK_N1)
-
-    for off_n1_start in range(0, N1, BLOCK_N1):
+    offs_n1 = tl.arange(0, BLOCK_N1)
+    off_n1_start = 0
+    grad_w_block_ptr = tl.make_block_ptr(
+        base=GradW,
+        shape=(N3, N2),
+        strides=(stride_w_n3, stride_w_n2),
+        offsets=(pid_n3 * BLOCK_N3, 0),
+        block_shape=(BLOCK_N3, BLOCK_N2),
+        order=(1, 0),
+    )
+    w_block_ptr = tl.make_block_ptr(
+        base=W,
+        shape=(N3, N2),
+        strides=(stride_w_n3, stride_w_n2),
+        offsets=(pid_n3 * BLOCK_N3, 0),
+        block_shape=(BLOCK_N3, BLOCK_N2),
+        order=(1, 0),
+    )
+    while off_n1_start < N1:
         offs_n1_curr = off_n1_start + offs_n1
         mask_n1 = offs_n1_curr < N1
         lse = tl.load(LSE + offs_n1_curr, mask=mask_n1, other=0.0)
-        target = tl.load(Y + offs_n1_curr, mask=mask_n1, other=0)
-        grad_out = tl.load(GradOut + offs_n1_curr, mask=mask_n1, other=0.0).to(
-            tl.float32
-        )
-
-        # Recompute logits
-        logits = tl.zeros([BLOCK_N1, BLOCK_N3], dtype=tl.float32)
+        target_y = tl.load(Y + offs_n1_curr, mask=mask_n1, other=0)
+        grad_out = tl.load(GradOut + offs_n1_curr, mask=mask_n1, other=0.0).to(p_dtype)
+        logits = tl.zeros([BLOCK_N1, BLOCK_N3], dtype=p_dtype)
         if HAS_BIAS:
-            logits += tl.load(B + offs_n3 * stride_b_n3, mask=mask_n3, other=0.0).to(
-                tl.float32
-            )[None, :]
-
-        for off_n2_start in range(0, N2, BLOCK_N2):
-            offs_n2_curr = off_n2_start + offs_n2
-            mask_n2 = offs_n2_curr < N2
-            x_chunk = tl.load(
-                X
-                + (
-                    offs_n1_curr[:, None] * stride_x_n1
-                    + offs_n2_curr[None, :] * stride_x_n2
-                ),
-                mask=mask_n1[:, None] & mask_n2[None, :],
-                other=0.0,
+            bias_val = tl.load(B + offs_n3 * stride_b_n3, mask=mask_n3, other=0.0)
+            logits += bias_val.to(p_dtype)[None, :]
+        x_block_ptr = tl.make_block_ptr(
+            base=X,
+            shape=(N1, N2),
+            strides=(stride_x_n1, stride_x_n2),
+            offsets=(off_n1_start, 0),
+            block_shape=(BLOCK_N1, BLOCK_N2),
+            order=(1, 0),
+        )
+        x_ptr = x_block_ptr
+        w_ptr = w_block_ptr
+        for k in range(0, N2, BLOCK_N2):
+            x_chunk = tl.load(x_ptr, boundary_check=(0, 1))
+            w_chunk = tl.load(w_ptr, boundary_check=(0, 1))
+            logits = tl.dot(
+                x_chunk,
+                tl.trans(w_chunk),
+                logits,
+                input_precision=INPUT_PRECISION,
+                out_dtype=p_dtype,
             )
-            w_chunk = tl.load(
-                W
-                + (
-                    offs_n3[None, :] * stride_w_n3 + offs_n2_curr[:, None] * stride_w_n2
-                ),
-                mask=mask_n2[:, None] & mask_n3[None, :],
-                other=0.0,
-            )
-            logits = tl.dot(x_chunk, w_chunk, logits, allow_tf32=True)
-
-        logits = tl.where(mask_n1[:, None] & mask_n3[None, :], logits, -float("inf"))
+            x_ptr = tl.advance(x_ptr, (0, BLOCK_N2))
+            w_ptr = tl.advance(w_ptr, (0, BLOCK_N2))
+        logits = tl.where(mask_n1[:, None], logits, -float("inf"))
         probs = tl.exp(logits - lse[:, None])
-        probs = tl.where(mask_n1[:, None] & mask_n3[None, :], probs, 0.0)
-        is_target = offs_n3[None, :] == target[:, None]
+        probs = tl.where(mask_n1[:, None], probs, 0.0)
+        is_target = offs_n3[None, :] == target_y[:, None]
         probs = tl.where(is_target & mask_n1[:, None], probs - 1.0, probs)
-        grad_logits = (probs * grad_out[:, None]).to(X.dtype.element_ty)
-
-        for off_n2_start in range(0, N2, BLOCK_N2):
-            offs_n2_curr = off_n2_start + offs_n2
-            mask_n2 = offs_n2_curr < N2
-            x_chunk = tl.load(
-                X
-                + (
-                    offs_n1_curr[:, None] * stride_x_n1
-                    + offs_n2_curr[None, :] * stride_x_n2
-                ),
-                mask=mask_n1[:, None] & mask_n2[None, :],
-                other=0.0,
+        grad_logits_t = tl.trans((probs * grad_out[:, None]).to(c_dtype))
+        x_ptr = x_block_ptr
+        g_ptr = grad_w_block_ptr
+        for k in range(0, N2, BLOCK_N2):
+            x_chunk = tl.load(x_ptr, boundary_check=(0, 1))
+            dw_part = tl.load(g_ptr, boundary_check=(0, 1))
+            dw_part = tl.dot(
+                grad_logits_t,
+                x_chunk,
+                dw_part,
+                input_precision=INPUT_PRECISION,
+                out_dtype=c_dtype,
             )
-            dw_part = tl.dot(tl.trans(grad_logits), x_chunk, allow_tf32=True)
-
-            # Use add store
-            grad_w_ptr = GradW + (
-                offs_n3[:, None] * stride_w_n3 + offs_n2_curr[None, :] * stride_w_n2
-            )
-            current_grad_w = tl.load(
-                grad_w_ptr, mask=mask_n3[:, None] & mask_n2[None, :], other=0.0
-            )
-            tl.store(
-                grad_w_ptr,
-                current_grad_w + dw_part.to(W.dtype.element_ty),
-                mask=mask_n3[:, None] & mask_n2[None, :],
-            )
+            tl.store(g_ptr, dw_part, boundary_check=(0, 1))
+            x_ptr = tl.advance(x_ptr, (0, BLOCK_N2))
+            g_ptr = tl.advance(g_ptr, (0, BLOCK_N2))
+        off_n1_start += BLOCK_N1
 
 
 @triton.jit
@@ -310,80 +310,99 @@ def _fused_nll_bwd_db_kernel(
     stride_w_n3,
     stride_w_n2,
     stride_b_n3,
-    N1: tl.constexpr,
+    N1,
     N2: tl.constexpr,
-    N3: tl.constexpr,
+    N3,
     BLOCK_N1: tl.constexpr,
     BLOCK_N2: tl.constexpr,
     BLOCK_N3: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr = "tf32",
+    HAS_BIAS: tl.constexpr = None,
 ):
+    c_dtype = X.dtype.element_ty
     pid_n3 = tl.program_id(0)
     offs_n3 = pid_n3 * BLOCK_N3 + tl.arange(0, BLOCK_N3)
     mask_n3 = offs_n3 < N3
-    db_acc = tl.zeros([BLOCK_N3], dtype=tl.float32)
-    offs_n1, offs_n2 = tl.arange(0, BLOCK_N1), tl.arange(0, BLOCK_N2)
-    for off_n1_start in range(0, N1, BLOCK_N1):
+    db_acc = tl.zeros([BLOCK_N3], dtype=p_dtype)
+    w_block_ptr = tl.make_block_ptr(
+        base=W,
+        shape=(N3, N2),
+        strides=(stride_w_n3, stride_w_n2),
+        offsets=(pid_n3 * BLOCK_N3, 0),
+        block_shape=(BLOCK_N3, BLOCK_N2),
+        order=(1, 0),
+    )
+    offs_n1 = tl.arange(0, BLOCK_N1)
+    off_n1_start = 0
+    while off_n1_start < N1:
         offs_n1_curr = off_n1_start + offs_n1
         mask_n1 = offs_n1_curr < N1
-        target, lse, grad_out = (
-            tl.load(Y + offs_n1_curr, mask=mask_n1, other=0),
-            tl.load(LSE + offs_n1_curr, mask=mask_n1, other=0.0),
-            tl.load(GradOut + offs_n1_curr, mask=mask_n1, other=0.0).to(tl.float32),
+        target_y = tl.load(Y + offs_n1_curr, mask=mask_n1, other=0)
+        lse = tl.load(LSE + offs_n1_curr, mask=mask_n1, other=0.0)
+        grad_out = tl.load(GradOut + offs_n1_curr, mask=mask_n1, other=0.0).to(p_dtype)
+        logits = tl.zeros([BLOCK_N1, BLOCK_N3], dtype=p_dtype)
+        bias_val = tl.load(B + offs_n3 * stride_b_n3, mask=mask_n3, other=0.0)
+        logits += bias_val.to(p_dtype)[None, :]
+        x_block_ptr = tl.make_block_ptr(
+            base=X,
+            shape=(N1, N2),
+            strides=(stride_x_n1, stride_x_n2),
+            offsets=(off_n1_start, 0),
+            block_shape=(BLOCK_N1, BLOCK_N2),
+            order=(1, 0),
         )
-        logits = (
-            tl.zeros([BLOCK_N1, BLOCK_N3], dtype=tl.float32)
-            + tl.load(B + offs_n3 * stride_b_n3, mask=mask_n3, other=0.0).to(
-                tl.float32
-            )[None, :]
-        )
-        for off_n2_start in range(0, N2, BLOCK_N2):
-            offs_n2_curr = off_n2_start + offs_n2
-            mask_n2 = offs_n2_curr < N2
-            x_chunk = tl.load(
-                X
-                + (
-                    offs_n1_curr[:, None] * stride_x_n1
-                    + offs_n2_curr[None, :] * stride_x_n2
-                ),
-                mask=mask_n1[:, None] & mask_n2[None, :],
-                other=0.0,
+        x_ptr = x_block_ptr
+        w_ptr = w_block_ptr
+        for k in range(0, N2, BLOCK_N2):
+            x_chunk = tl.load(x_ptr, boundary_check=(0, 1))
+            w_chunk = tl.load(w_ptr, boundary_check=(0, 1))
+            logits = tl.dot(
+                x_chunk,
+                tl.trans(w_chunk),
+                logits,
+                input_precision=INPUT_PRECISION,
+                out_dtype=p_dtype,
             )
-            w_chunk = tl.load(
-                W
-                + (
-                    offs_n3[None, :] * stride_w_n3 + offs_n2_curr[:, None] * stride_w_n2
-                ),
-                mask=mask_n2[:, None] & mask_n3[None, :],
-                other=0.0,
-            )
-            logits = tl.dot(x_chunk, w_chunk, logits, allow_tf32=True)
-        logits = tl.where(mask_n1[:, None] & mask_n3[None, :], logits, -float("inf"))
+            x_ptr = tl.advance(x_ptr, (0, BLOCK_N2))
+            w_ptr = tl.advance(w_ptr, (0, BLOCK_N2))
+        logits = tl.where(mask_n1[:, None], logits, -float("inf"))
         probs = tl.exp(logits - lse[:, None])
-        probs = tl.where(mask_n1[:, None] & mask_n3[None, :], probs, 0.0)
-        is_target = offs_n3[None, :] == target[:, None]
+        probs = tl.where(mask_n1[:, None], probs, 0.0)
+        is_target = offs_n3[None, :] == target_y[:, None]
         probs = tl.where(is_target & mask_n1[:, None], probs - 1.0, probs)
         db_acc += tl.sum(probs * grad_out[:, None], 0)
-
-    tl.store(GradB + offs_n3 * stride_b_n3, db_acc.to(B.dtype.element_ty), mask=mask_n3)
+        off_n1_start += BLOCK_N1
+    tl.store(GradB + offs_n3 * stride_b_n3, db_acc.to(c_dtype), mask=mask_n3)
 
 
 class TritonFusedNLL(torch.autograd.Function):
-    TRITON_KWARGS = dict(
-        BLOCK_N1=64,
-        BLOCK_N2=64,
-        BLOCK_N3=64,
-        num_warps=4,
-    )
+    TRITON_KWARGS = dict(BLOCK_N1=64, BLOCK_N2=64, BLOCK_N3=64, num_warps=4)
 
     @staticmethod
     def forward(ctx, x, target, weight, bias=None):
+        assert x.ndim == 2, f"x must be 2D, got {x.ndim}"
+        assert weight.ndim == 2, f"weight must be 2D, got {weight.ndim}"
+        assert target.ndim == 1, f"target must be 1D, got {target.ndim}"
+        assert x.shape[1] == weight.shape[1], (
+            "x and weight must have the same hidden dimension"
+        )
+        assert x.shape[0] == target.shape[0], (
+            "x and target must have the same batch size"
+        )
+        assert x.dtype == weight.dtype, "x and weight must have the same dtype"
+        if bias is not None:
+            assert bias.ndim == 1, f"bias must be 1D, got {bias.ndim}"
+            assert bias.shape[0] == weight.shape[0], (
+                "bias size must match weight output size"
+            )
+            assert bias.dtype == x.dtype, "bias must have the same dtype as x"
         target_i32 = target.to(torch.int32).contiguous()
         has_bias = bias is not None
         if not has_bias:
             bias = x.new_empty((1,), dtype=x.dtype)
         N1, N2, N3 = x.shape[0], x.shape[1], weight.shape[0]
-        out = torch.empty((N1,), device=x.device, dtype=x.dtype)
-        lse = torch.empty((N1,), device=x.device, dtype=torch.float32)
+        out = x.new_empty((N1,), dtype=x.dtype)
+        lse = x.new_empty((N1,), dtype=TORCH_P_DTYPE)
         _fused_nll_fwd_kernel[lambda META: (triton.cdiv(N1, META["BLOCK_N1"]),)](
             x,
             target_i32,

@@ -30,7 +30,8 @@ CONFIGS = [
 
 @pytest.mark.parametrize("N, D_in, D_out", CONFIGS)
 @pytest.mark.parametrize("has_bias", [True, False])
-def test_fused_nll_accuracy(N, D_in, D_out, has_bias):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_fused_nll_accuracy(N, D_in, D_out, has_bias, dtype):
     """
     Tests the numerical accuracy of the Triton Fused NLL kernel against
     the PyTorch reference implementation.
@@ -44,7 +45,10 @@ def test_fused_nll_accuracy(N, D_in, D_out, has_bias):
 
     torch.manual_seed(0)
     device = torch.device("cpu")
-    dtype = torch.float32
+    tol = {
+        torch.float32: {"L_atol": 1e-1, "G_atol": 1e-3, "rtol": 1e-5},
+        torch.float16: {"L_atol": 1.0, "G_atol": 0.5, "rtol": 1e-2},
+    }[dtype]
 
     x = torch.randn(N, D_in, device=device, requires_grad=True, dtype=dtype)
     target = torch.randint(0, D_out, (N,), device=device)
@@ -73,8 +77,12 @@ def test_fused_nll_accuracy(N, D_in, D_out, has_bias):
     loss_ref.sum().backward()
 
     # --- Numerical Validation ---
-    assert torch.allclose(loss_triton, loss_ref, atol=1.0, rtol=0)
-    assert torch.allclose(grad_x_triton, x.grad, atol=0.1, rtol=0)
-    assert torch.allclose(grad_w_triton, weight.grad, atol=0.1, rtol=0)
+    assert torch.allclose(loss_triton, loss_ref, atol=tol["L_atol"], rtol=tol["rtol"])
+    assert torch.allclose(grad_x_triton, x.grad, atol=tol["G_atol"], rtol=tol["rtol"])
+    assert torch.allclose(
+        grad_w_triton, weight.grad, atol=tol["G_atol"], rtol=tol["rtol"]
+    )
     if has_bias:
-        assert torch.allclose(grad_b_triton, bias.grad, atol=0.1, rtol=0)
+        assert torch.allclose(
+            grad_b_triton, bias.grad, atol=tol["G_atol"], rtol=tol["rtol"]
+        )
