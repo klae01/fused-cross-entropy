@@ -46,6 +46,12 @@ quote-style = "double"
 indent-style = "space"
 
 [dependency-groups]
+benchmark = [
+    "liger-kernel>=0.6.4",
+    "matplotlib>=3.7.5",
+    "pandas>=2.0.3",
+    "seaborn>=0.13.2",
+]
 ci-error = ["pytest"]
 ci-ruff = ["ruff"]
 dev = [

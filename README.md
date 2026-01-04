@@ -5,7 +5,7 @@ A Triton implementation of the Fused Cross-Entropy loss function.
 ## Installation
 
 ```bash
-pip install git+https://github.com/your-username/fused-cross-entropy.git
+pip install git+https://github.com/klae01/fused-cross-entropy.git
 ```
 
 ## Development
@@ -29,3 +29,17 @@ The test suite validates the numerical accuracy of the Triton kernels against th
 # This forces the Triton interpreter (CPU backend)
 TRITON_INTERPRET=1 pytest
 ```
+
+## Benchmarking
+
+Run the benchmark suite to compare performance against baselines.
+
+### Usage
+
+```bash
+uv run --group benchmark benchmarks/run_benchmark.py --mode orchestrator --output_dir assets
+```
+
+### Results
+
+![Benchmark Results](./assets/benchmark_results.png)

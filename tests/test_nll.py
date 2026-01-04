@@ -6,6 +6,23 @@ import torch.nn.functional as F
 
 from fused_cross_entropy import TritonFusedNLL
 
+
+@pytest.fixture(autouse=True)
+def skip_optimizer_for_tests(monkeypatch):
+    from fused_cross_entropy.optimizer import KernelOptimizer
+
+    def mock_get_config(cls, *args, **kwargs):
+        return {
+            "BLOCK_N1": 32,
+            "BLOCK_N2": 32,
+            "BLOCK_N3": 32,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+
+    monkeypatch.setattr(KernelOptimizer, "get_best_config", mock_get_config)
+
+
 # Configurations to test (N1, N2, N3)
 CONFIGS = [
     (1, 1, 1),
